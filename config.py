@@ -1,6 +1,7 @@
-BOT_TOKEN = "8755265652:AAFbuu8JphgLK9RcOou9GG_4daJkEIhDnX8"
+import os
 
-# Top kripto juftliklar kuzatish uchun
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+
 TOP_SYMBOLS = [
     "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT",
     "TON/USDT", "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "DOT/USDT",
@@ -8,14 +9,7 @@ TOP_SYMBOLS = [
     "BCH/USDT", "APT/USDT", "OP/USDT", "ARB/USDT", "SUI/USDT"
 ]
 
-# Signal kuchi chegaralari
 RSI_OVERSOLD = 30
 RSI_OVERBOUGHT = 70
-RSI_STRONG_OVERSOLD = 20
-RSI_STRONG_OVERBOUGHT = 80
 
-# Signal intervali
 SIGNAL_INTERVAL_MINUTES = 15
-
-# Yangiliklar uchun
-NEWS_API_URL = "https://cryptopanic.com/api/v1/posts/?auth_token=public&kind=news&filter=hot"
