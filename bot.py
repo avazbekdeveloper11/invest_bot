@@ -3,19 +3,23 @@ from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes,
+    ContextTypes, MessageHandler, filters, ConversationHandler,
 )
 from config import BOT_TOKEN, TOP_SYMBOLS, SIGNAL_INTERVAL_MINUTES
-from analyzer import analyze, get_top_buy_opportunities, get_market_summary
+from analyzer import analyze, get_price, get_top_buy_opportunities, get_market_summary
 from news import get_crypto_news
+from positions import add_position, get_positions, remove_position, get_all_positions, update_alert_flags
 
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 subscribers: set[int] = set()
+
+# ConversationHandler states
+ASK_AMOUNT = 1
+
+# Vaqtincha saqlanadigan ma'lumot (foydalanuvchi miqdor kiritishidan oldin)
+pending_buy: dict[int, dict] = {}
 
 
 def format_price(price: float) -> str:
@@ -24,12 +28,23 @@ def format_price(price: float) -> str:
     return f"${price:.8f}"
 
 
+def pnl_emoji(pct: float) -> str:
+    if pct >= 5:
+        return "🚀"
+    if pct >= 2:
+        return "📈"
+    if pct >= 0:
+        return "🟡"
+    if pct >= -3:
+        return "⚠️"
+    return "🔴"
+
+
 def build_analysis_text(data: dict) -> str:
     price_str = format_price(data['price'])
     tp_str = format_price(data['take_profit'])
     sl_str = format_price(data['stop_loss'])
     rr = abs((data['take_profit'] - data['price']) / max(data['price'] - data['stop_loss'], 0.0001))
-
     lines = [
         f"{data['emoji']} *{data['symbol']}* — {data['action']}",
         f"💰 Narx: `{price_str}`",
@@ -52,7 +67,7 @@ def build_analysis_text(data: dict) -> str:
 
 
 def main_keyboard() -> InlineKeyboardMarkup:
-    buttons = [
+    return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("💰 Narxni tekshir", callback_data="prices"),
             InlineKeyboardButton("📊 Analiz", callback_data="signals"),
@@ -63,10 +78,12 @@ def main_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("📰 Yangiliklar", callback_data="news"),
+            InlineKeyboardButton("💼 Pozitsiyalarim", callback_data="my_positions"),
+        ],
+        [
             InlineKeyboardButton("🔔 Auto-signal", callback_data="sub_toggle"),
         ],
-    ]
-    return InlineKeyboardMarkup(buttons)
+    ])
 
 
 def coin_keyboard(action: str) -> InlineKeyboardMarkup:
@@ -98,8 +115,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "faqat *sotib olish* imkoniyatlarini topib beradi.\n\n"
         "• 📊 RSI, MACD, EMA, Bollinger tahlili\n"
         "• 🎯 Take-Profit va Stop-Loss avtomatik\n"
-        "• 🔔 Har 15 daqiqada yangi BUY signal\n"
-        "• 20 ta top koin kuzatiladi\n\n"
+        "• 💼 Pozitsiyani saqlash va kuzatish\n"
+        "• ⚠️ Zarar xavfi bo'lsa avtomatik ogohlantirish\n"
+        "• 🔔 Har 15 daqiqada yangi BUY signal\n\n"
         "Quyidagi tugmalardan foydalaning:"
     )
     await update.message.reply_text(text, parse_mode='Markdown', reply_markup=main_keyboard())
@@ -109,24 +127,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+    chat_id = query.message.chat_id
 
     if data == "back":
-        await query.edit_message_text(
-            "🏠 *Asosiy menyu*",
-            parse_mode='Markdown',
-            reply_markup=main_keyboard()
-        )
+        await query.edit_message_text("🏠 *Asosiy menyu*", parse_mode='Markdown', reply_markup=main_keyboard())
 
     elif data == "prices":
-        await query.edit_message_text(
-            "💰 *Qaysi koin narxini ko'rmoqchisiz?*",
-            parse_mode='Markdown',
-            reply_markup=coin_keyboard("price")
-        )
+        await query.edit_message_text("💰 *Qaysi koin narxini ko'rmoqchisiz?*",
+                                       parse_mode='Markdown', reply_markup=coin_keyboard("price"))
 
     elif data.startswith("price_"):
         symbol = data[6:]
-        from analyzer import get_price
         p = get_price(symbol)
         if p:
             change = p['change_24h'] or 0
@@ -150,39 +161,54 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, parse_mode='Markdown', reply_markup=kb)
 
     elif data == "signals":
-        await query.edit_message_text(
-            "📊 *Qaysi koin uchun analiz kerak?*",
-            parse_mode='Markdown',
-            reply_markup=coin_keyboard("coin")
-        )
+        await query.edit_message_text("📊 *Qaysi koin uchun analiz kerak?*",
+                                       parse_mode='Markdown', reply_markup=coin_keyboard("coin"))
 
     elif data.startswith("coin_"):
         symbol = data[5:]
-        await query.edit_message_text(
-            f"⏱ *{symbol}* — vaqt oralig'ini tanlang:",
-            parse_mode='Markdown',
-            reply_markup=timeframe_keyboard(symbol)
-        )
+        await query.edit_message_text(f"⏱ *{symbol}* — vaqt oralig'ini tanlang:",
+                                       parse_mode='Markdown', reply_markup=timeframe_keyboard(symbol))
 
     elif data.startswith("tf_"):
-        last_underscore = data.rfind("_")
-        timeframe = data[last_underscore + 1:]
-        symbol = data[3:last_underscore]
-
+        last = data.rfind("_")
+        timeframe = data[last + 1:]
+        symbol = data[3:last]
         await query.edit_message_text("⏳ Tahlil qilinmoqda...", parse_mode='Markdown')
         result = analyze(symbol, timeframe)
         if result:
             text = build_analysis_text(result)
-            # Faqat BUY bo'lsa alohida eslatma
             if result['score'] < 2:
                 text += "\n\n⚠️ _Hozir BUY uchun qulay vaqt emas. Kuting._"
-            kb = InlineKeyboardMarkup([[
+            buttons = [[
                 InlineKeyboardButton("🔄 Yangilash", callback_data=f"tf_{symbol}_{timeframe}"),
                 InlineKeyboardButton("🔙 Orqaga", callback_data="back"),
-            ]])
-            await query.edit_message_text(text, parse_mode='Markdown', reply_markup=kb)
+            ]]
+            if result['score'] >= 2:
+                buttons.insert(0, [InlineKeyboardButton(
+                    "✅ Shu narxda sotib oldim", callback_data=f"bought_{symbol}"
+                )])
+            await query.edit_message_text(text, parse_mode='Markdown',
+                                           reply_markup=InlineKeyboardMarkup(buttons))
         else:
             await query.edit_message_text("❌ Xatolik. Qayta urinib ko'ring.", reply_markup=main_keyboard())
+
+    elif data.startswith("bought_"):
+        symbol = data[7:]
+        result = analyze(symbol)
+        if result:
+            pending_buy[chat_id] = {
+                "symbol": symbol,
+                "buy_price": result['price'],
+                "take_profit": result['take_profit'],
+                "stop_loss": result['stop_loss'],
+            }
+            context.user_data['waiting_amount'] = True
+            await query.edit_message_text(
+                f"💰 *{symbol}* — `{format_price(result['price'])}`\n\n"
+                f"Qancha USDT ga sotib oldingiz?\n"
+                f"_(Masalan: 50 yoki 100.5)_",
+                parse_mode='Markdown'
+            )
 
     elif data == "buy_opps":
         await query.edit_message_text("🔍 Eng yaxshi BUY imkoniyatlar qidirilmoqda...", parse_mode='Markdown')
@@ -197,17 +223,85 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"   RSI: {r['rsi']:.1f} | Kuch: {r['score']}/6\n"
                 )
             text = "\n".join(lines)
+            buttons = []
+            for r in buys:
+                buttons.append([InlineKeyboardButton(
+                    f"✅ {r['symbol']} sotib oldim", callback_data=f"bought_{r['symbol']}"
+                )])
+            buttons.append([
+                InlineKeyboardButton("🔄 Yangilash", callback_data="buy_opps"),
+                InlineKeyboardButton("🔙 Orqaga", callback_data="back"),
+            ])
         else:
-            text = (
-                "😐 *Hozircha kuchli BUY signal yo'q.*\n\n"
-                "Bozor neytral yoki pastga ketmoqda.\n"
-                "Biroz kuting va qayta tekshiring."
-            )
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔄 Yangilash", callback_data="buy_opps"),
-            InlineKeyboardButton("🔙 Orqaga", callback_data="back"),
-        ]])
+            text = "😐 *Hozircha kuchli BUY signal yo'q.*\n\nBozor neytral. Biroz kuting."
+            buttons = [[
+                InlineKeyboardButton("🔄 Yangilash", callback_data="buy_opps"),
+                InlineKeyboardButton("🔙 Orqaga", callback_data="back"),
+            ]]
+        await query.edit_message_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data == "my_positions":
+        positions = get_positions(chat_id)
+        if not positions:
+            text = "💼 *Ochiq pozitsiyalar yo'q.*\n\nSignal bo'yicha sotib olganingizda \"Sotib oldim\" tugmasini bosing."
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Orqaga", callback_data="back")]])
+        else:
+            lines = [f"💼 *Ochiq pozitsiyalar* ({len(positions)} ta)\n"]
+            for i, p in enumerate(positions):
+                cur = get_price(p['symbol'])
+                if cur:
+                    cur_price = cur['price']
+                    cur_val = p['coins'] * cur_price
+                    pnl_usd = cur_val - p['amount_usd']
+                    pnl_pct = (pnl_usd / p['amount_usd']) * 100
+                    em = pnl_emoji(pnl_pct)
+                    lines.append(
+                        f"{i+1}. {em} *{p['symbol']}*\n"
+                        f"   Kirish: `{format_price(p['buy_price'])}` → Hozir: `{format_price(cur_price)}`\n"
+                        f"   Miqdor: `${p['amount_usd']:.1f}` → Qiymat: `${cur_val:.2f}`\n"
+                        f"   PnL: `{pnl_usd:+.2f}$ ({pnl_pct:+.1f}%)`\n"
+                        f"   🎯 TP: `{format_price(p['take_profit'])}` | 🛑 SL: `{format_price(p['stop_loss'])}`\n"
+                        f"   📅 {p['opened_at']}\n"
+                    )
+                else:
+                    lines.append(f"{i+1}. *{p['symbol']}* — narx olinmadi\n")
+            text = "\n".join(lines)
+            close_buttons = [
+                [InlineKeyboardButton(f"❌ {i+1}. {p['symbol']} yopish", callback_data=f"close_pos_{i}")]
+                for i, p in enumerate(positions)
+            ]
+            close_buttons.append([
+                InlineKeyboardButton("🔄 Yangilash", callback_data="my_positions"),
+                InlineKeyboardButton("🔙 Orqaga", callback_data="back"),
+            ])
+            kb = InlineKeyboardMarkup(close_buttons)
         await query.edit_message_text(text, parse_mode='Markdown', reply_markup=kb)
+
+    elif data.startswith("close_pos_"):
+        idx = int(data[10:])
+        positions = get_positions(chat_id)
+        if 0 <= idx < len(positions):
+            p = positions[idx]
+            cur = get_price(p['symbol'])
+            if cur:
+                cur_price = cur['price']
+                pnl_usd = (p['coins'] * cur_price) - p['amount_usd']
+                pnl_pct = (pnl_usd / p['amount_usd']) * 100
+                em = pnl_emoji(pnl_pct)
+                result_text = (
+                    f"{em} *{p['symbol']}* pozitsiya yopildi\n\n"
+                    f"Kirish: `{format_price(p['buy_price'])}`\n"
+                    f"Chiqish: `{format_price(cur_price)}`\n"
+                    f"Natija: `{pnl_usd:+.2f}$ ({pnl_pct:+.1f}%)`\n"
+                )
+            else:
+                result_text = f"*{p['symbol']}* pozitsiya yopildi."
+            remove_position(chat_id, idx)
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("💼 Pozitsiyalarim", callback_data="my_positions"),
+                InlineKeyboardButton("🔙 Menyu", callback_data="back"),
+            ]])
+            await query.edit_message_text(result_text, parse_mode='Markdown', reply_markup=kb)
 
     elif data == "market":
         await query.edit_message_text("🌍 Bozor tahlil qilinmoqda...", parse_mode='Markdown')
@@ -215,25 +309,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bullish = sum(1 for r in results if r['score'] >= 2)
         bearish = sum(1 for r in results if r['score'] <= -2)
         neutral = len(results) - bullish - bearish
-
         mood = "🟢 BULLISH — Sotib olish vaqti!" if bullish > bearish else \
-               "🔴 BEARISH — Ehtiyot bo'ling" if bearish > bullish else \
-               "🟡 NEYTRAL — Kuting"
-
+               "🔴 BEARISH — Ehtiyot bo'ling" if bearish > bullish else "🟡 NEYTRAL — Kuting"
         lines = [
             f"🌍 *Bozor holati:* {mood}\n",
-            f"🟢 BUY signal: *{bullish}* ta koin",
-            f"🟡 Neytral: *{neutral}* ta koin",
-            f"🔴 Pastga: *{bearish}* ta koin\n",
+            f"🟢 BUY signal: *{bullish}* ta",
+            f"🟡 Neytral: *{neutral}* ta",
+            f"🔴 Pastga: *{bearish}* ta\n",
             "🚀 *BUY uchun tayyor koinlar:*",
         ]
-        buy_ready = [r for r in results if r['score'] >= 2][:8]
-        if buy_ready:
-            for r in buy_ready:
-                lines.append(f"  ✅ *{r['symbol']}*: {format_price(r['price'])} | Ball: {r['score']}")
-        else:
+        for r in [x for x in results if x['score'] >= 2][:8]:
+            lines.append(f"  ✅ *{r['symbol']}*: {format_price(r['price'])} | Ball: {r['score']}")
+        if not any(r['score'] >= 2 for r in results):
             lines.append("  😐 Hozircha yo'q")
-
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("🔄 Yangilash", callback_data="market"),
             InlineKeyboardButton("🔙 Orqaga", callback_data="back"),
@@ -254,11 +342,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🔄 Yangilash", callback_data="news"),
             InlineKeyboardButton("🔙 Orqaga", callback_data="back"),
         ]])
-        await query.edit_message_text(text, parse_mode='Markdown', reply_markup=kb,
-                                       disable_web_page_preview=True)
+        await query.edit_message_text(text, parse_mode='Markdown', reply_markup=kb, disable_web_page_preview=True)
 
     elif data == "sub_toggle":
-        chat_id = query.message.chat_id
         if chat_id in subscribers:
             subscribers.discard(chat_id)
             msg = "🔕 Auto-signal *o'chirildi*."
@@ -273,13 +359,54 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(msg, parse_mode='Markdown', reply_markup=kb)
 
 
+async def amount_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    if chat_id not in pending_buy:
+        return
+
+    text = update.message.text.strip().replace(",", ".")
+    try:
+        amount_usd = float(text)
+        if amount_usd <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Noto'g'ri miqdor. Faqat raqam kiriting. Masalan: `50` yoki `120.5`",
+            parse_mode='Markdown'
+        )
+        return
+
+    info = pending_buy.pop(chat_id)
+    add_position(
+        chat_id=chat_id,
+        symbol=info['symbol'],
+        buy_price=info['buy_price'],
+        amount_usd=amount_usd,
+        take_profit=info['take_profit'],
+        stop_loss=info['stop_loss'],
+    )
+
+    coins = amount_usd / info['buy_price']
+    await update.message.reply_text(
+        f"✅ *Pozitsiya saqlandi!*\n\n"
+        f"🪙 *{info['symbol']}*\n"
+        f"💰 Kirish narxi: `{format_price(info['buy_price'])}`\n"
+        f"💵 Miqdor: `${amount_usd:.2f}` → `{coins:.6f}` koin\n"
+        f"🎯 Take-Profit: `{format_price(info['take_profit'])}`\n"
+        f"🛑 Stop-Loss: `{format_price(info['stop_loss'])}`\n\n"
+        f"Narx o'zgarganda sizga xabar beraman! 🔔",
+        parse_mode='Markdown',
+        reply_markup=main_keyboard()
+    )
+
+
 async def auto_signal_job(context: ContextTypes.DEFAULT_TYPE):
+    """Har N daqiqada BUY signal yuborish"""
     if not subscribers:
         return
     buys = get_top_buy_opportunities()
     if not buys:
         return
-
     lines = [f"⚡ *BUY SIGNAL* — {datetime.now().strftime('%H:%M')}\n"]
     for r in buys[:4]:
         lines.append(
@@ -287,21 +414,106 @@ async def auto_signal_job(context: ContextTypes.DEFAULT_TYPE):
             f"   💰 {format_price(r['price'])} | 🎯 {format_price(r['take_profit'])} | 🛑 {format_price(r['stop_loss'])}\n"
             f"   RSI: {r['rsi']:.1f} | Kuch: {r['score']}/6\n"
         )
-
     text = "\n".join(lines)
+    buttons = [[InlineKeyboardButton(f"✅ {r['symbol']} sotib oldim", callback_data=f"bought_{r['symbol']}")]
+               for r in buys[:4]]
+    buttons.append([InlineKeyboardButton("💼 Pozitsiyalarim", callback_data="my_positions")])
     for chat_id in list(subscribers):
         try:
-            await context.bot.send_message(chat_id, text, parse_mode='Markdown', reply_markup=main_keyboard())
+            await context.bot.send_message(chat_id, text, parse_mode='Markdown',
+                                            reply_markup=InlineKeyboardMarkup(buttons))
         except Exception as e:
             logger.warning(f"Chat {chat_id}: {e}")
             subscribers.discard(chat_id)
 
 
+async def position_monitor_job(context: ContextTypes.DEFAULT_TYPE):
+    """Har 5 daqiqada barcha pozitsiyalarni kuzatish va xavf bo'lsa ogohlantirish"""
+    all_data = get_all_positions()
+    for str_chat_id, positions in all_data.items():
+        chat_id = int(str_chat_id)
+        for i, p in enumerate(positions):
+            cur = get_price(p['symbol'])
+            if not cur:
+                continue
+            cur_price = cur['price']
+            pnl_pct = ((cur_price - p['buy_price']) / p['buy_price']) * 100
+            cur_val = p['coins'] * cur_price
+            pnl_usd = cur_val - p['amount_usd']
+
+            # Stop-loss ga yaqinlashdi (5% ichida) yoki oshib ketdi
+            sl_dist_pct = ((cur_price - p['stop_loss']) / p['buy_price']) * 100
+
+            if not p.get('alerted_sl') and sl_dist_pct <= 5:
+                msg = (
+                    f"🚨 *ZARAR OGOHLANTIRISH!*\n\n"
+                    f"*{p['symbol']}* stop-loss ga yaqinlashdi!\n\n"
+                    f"📉 Hozirgi narx: `{format_price(cur_price)}`\n"
+                    f"🛑 Stop-Loss: `{format_price(p['stop_loss'])}`\n"
+                    f"📏 Masofa: `{sl_dist_pct:.1f}%`\n"
+                    f"💸 Hozirgi PnL: `{pnl_usd:+.2f}$ ({pnl_pct:+.1f}%)`\n\n"
+                    f"⚠️ *Zararga kirish xavfi bor! Sotishni ko'rib chiqing.*"
+                )
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(f"❌ {p['symbol']} yopish", callback_data=f"close_pos_{i}"),
+                    InlineKeyboardButton("💼 Pozitsiyalar", callback_data="my_positions"),
+                ]])
+                try:
+                    await context.bot.send_message(chat_id, msg, parse_mode='Markdown', reply_markup=kb)
+                    update_alert_flags(chat_id, i, sl=True)
+                except Exception as e:
+                    logger.warning(f"Monitor alert {chat_id}: {e}")
+
+            # Take-profit ga yetdi
+            elif not p.get('alerted_tp') and cur_price >= p['take_profit']:
+                msg = (
+                    f"🎯 *TAKE-PROFIT YETDI!*\n\n"
+                    f"*{p['symbol']}* maqsad narxga yetdi!\n\n"
+                    f"📈 Hozirgi narx: `{format_price(cur_price)}`\n"
+                    f"🎯 Take-Profit: `{format_price(p['take_profit'])}`\n"
+                    f"💰 Foyda: `{pnl_usd:+.2f}$ ({pnl_pct:+.1f}%)`\n\n"
+                    f"✅ *Sotishni ko'rib chiqing!*"
+                )
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(f"✅ {p['symbol']} yopish (foyda)", callback_data=f"close_pos_{i}"),
+                    InlineKeyboardButton("💼 Pozitsiyalar", callback_data="my_positions"),
+                ]])
+                try:
+                    await context.bot.send_message(chat_id, msg, parse_mode='Markdown', reply_markup=kb)
+                    update_alert_flags(chat_id, i, tp=True)
+                except Exception as e:
+                    logger.warning(f"Monitor tp {chat_id}: {e}")
+
+            # SL oshib ketdi (narx SL dan past)
+            elif cur_price < p['stop_loss'] and not p.get('alerted_sl'):
+                msg = (
+                    f"🔴 *STOP-LOSS OSHDI!*\n\n"
+                    f"*{p['symbol']}* stop-loss narxidan past tushdi!\n\n"
+                    f"📉 Hozirgi narx: `{format_price(cur_price)}`\n"
+                    f"🛑 Stop-Loss: `{format_price(p['stop_loss'])}`\n"
+                    f"💸 Zarar: `{pnl_usd:+.2f}$ ({pnl_pct:+.1f}%)`\n\n"
+                    f"❗ *Zudlik bilan sotishni ko'rib chiqing!*"
+                )
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(f"❌ {p['symbol']} yopish", callback_data=f"close_pos_{i}"),
+                ]])
+                try:
+                    await context.bot.send_message(chat_id, msg, parse_mode='Markdown', reply_markup=kb)
+                    update_alert_flags(chat_id, i, sl=True)
+                except Exception as e:
+                    logger.warning(f"Monitor sl {chat_id}: {e}")
+
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, amount_input_handler))
+
     app.job_queue.run_repeating(auto_signal_job, interval=SIGNAL_INTERVAL_MINUTES * 60, first=60)
+    app.job_queue.run_repeating(position_monitor_job, interval=5 * 60, first=30)
+
     logger.info("Bot ishga tushdi!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
