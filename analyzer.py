@@ -6,7 +6,7 @@ from datetime import datetime
 exchange = ccxt.binance({'enableRateLimit': True})
 
 
-def get_ohlcv(symbol: str, timeframe: str = '15m', limit: int = 150) -> pd.DataFrame | None:
+def get_ohlcv(symbol: str, timeframe: str = '15m', limit: int = 200) -> pd.DataFrame | None:
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])

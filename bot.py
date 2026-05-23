@@ -102,9 +102,19 @@ def coin_keyboard(action: str) -> InlineKeyboardMarkup:
 
 
 def timeframe_keyboard(symbol: str) -> InlineKeyboardMarkup:
-    tfs = [('5m', '5 daqiqa'), ('15m', '15 daqiqa'), ('1h', '1 soat'), ('4h', '4 soat')]
-    buttons = [[InlineKeyboardButton(label, callback_data=f"tf_{symbol}_{tf}") for tf, label in tfs]]
-    buttons.append([InlineKeyboardButton("🔙 Orqaga", callback_data="back")])
+    buttons = [
+        [
+            InlineKeyboardButton("5 daqiqa", callback_data=f"tf_{symbol}_5m"),
+            InlineKeyboardButton("15 daqiqa", callback_data=f"tf_{symbol}_15m"),
+            InlineKeyboardButton("1 soat", callback_data=f"tf_{symbol}_1h"),
+        ],
+        [
+            InlineKeyboardButton("4 soat", callback_data=f"tf_{symbol}_4h"),
+            InlineKeyboardButton("1 kun", callback_data=f"tf_{symbol}_1d"),
+            InlineKeyboardButton("1 hafta", callback_data=f"tf_{symbol}_1w"),
+        ],
+        [InlineKeyboardButton("🔙 Orqaga", callback_data="back")],
+    ]
     return InlineKeyboardMarkup(buttons)
 
 
