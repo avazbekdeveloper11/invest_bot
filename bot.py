@@ -10,6 +10,7 @@ from analyzer import analyze, get_price, get_top_buy_opportunities, get_market_s
 from news import get_crypto_news
 from positions import add_position, get_positions, remove_position, get_all_positions, update_alert_flags
 from currency import get_uzs_rate, usd_to_uzs, format_uzs
+from signal_history import save_signal, get_stats, get_active_signals, update_signal_result
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -117,6 +118,7 @@ def main_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("💼 Pozitsiyalarim", callback_data="my_positions"),
         ],
         [
+            InlineKeyboardButton("📊 Statistika", callback_data="signal_stats"),
             InlineKeyboardButton("🔔 Auto-signal", callback_data="sub_toggle"),
         ],
     ])
@@ -226,11 +228,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⏳ Tahlil qilinmoqda...", parse_mode='Markdown')
         result = analyze(symbol, timeframe)
         if result:
+            # Signalni tarixga saqlash
+            sig_idx = save_signal(symbol, timeframe, result['price'],
+                                   result['take_profit'], result['stop_loss'], result['score'])
+
             text = build_analysis_text(result)
+            # $100 invest bilan foydani ko'rsatish
+            for invest in [50, 100, 500]:
+                pot = (result['take_profit'] - result['price']) / result['price'] * invest
+                text += f"\n💡 ${invest} → `+${pot:.1f}` foyda ({format_uzs(usd_to_uzs(pot))})"
+
             if result['score'] < 2:
                 text += "\n\n⚠️ _Hozir BUY uchun qulay vaqt emas. Kuting._"
             buttons = [[
                 InlineKeyboardButton("🔄 Yangilash", callback_data=f"tf_{symbol}_{timeframe}"),
+                InlineKeyboardButton("📊 Statistika", callback_data="signal_stats"),
                 InlineKeyboardButton("🔙 Orqaga", callback_data="back"),
             ]]
             if result['score'] >= 2:
@@ -405,6 +417,45 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]])
         await query.edit_message_text(text, parse_mode='Markdown', reply_markup=kb, disable_web_page_preview=True)
 
+    elif data == "signal_stats":
+        stats = get_stats()
+        if stats['closed'] == 0:
+            text = (
+                "📊 *Signal statistikasi*\n\n"
+                "Hali yopilgan signal yo'q.\n"
+                f"🟡 Faol signallar: *{stats['active']}* ta\n\n"
+                "_Signallar TP yoki SL ga tegishi bilan natija chiqadi._"
+            )
+        else:
+            bar_w = round(stats['win_rate'] / 10)
+            bar = "🟢" * bar_w + "🔴" * (10 - bar_w)
+            text_lines = [
+                "📊 *Signal statistikasi*\n",
+                f"{bar}",
+                f"🎯 To'g'ri signal: *{stats['win_rate']:.1f}%* ({stats['wins']}/{stats['closed']})\n",
+                f"✅ G'alaba: *{stats['wins']}* ta | avg +{stats['avg_win']:.1f}%",
+                f"❌ Zarar: *{stats['losses']}* ta | avg {stats['avg_loss']:.1f}%",
+                f"🟡 Faol: *{stats['active']}* ta\n",
+                "🕐 *Oxirgi signallar:*",
+            ]
+            for s in stats['recent'][:7]:
+                if s['result'] == 'WIN':
+                    icon = "✅"
+                    res = f"+{s['profit_pct']:.1f}%"
+                elif s['result'] == 'LOSS':
+                    icon = "❌"
+                    res = f"{s['profit_pct']:.1f}%"
+                else:
+                    icon = "🟡"
+                    res = "faol"
+                text_lines.append(f"  {icon} *{s['symbol']}* ({s['timeframe']}) — {res} | {s['created_at'][:10]}")
+            text = "\n".join(text_lines)
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔄 Yangilash", callback_data="signal_stats"),
+            InlineKeyboardButton("🔙 Orqaga", callback_data="back"),
+        ]])
+        await query.edit_message_text(text, parse_mode='Markdown', reply_markup=kb)
+
     elif data == "sub_toggle":
         if chat_id in subscribers:
             subscribers.discard(chat_id)
@@ -489,6 +540,20 @@ async def auto_signal_job(context: ContextTypes.DEFAULT_TYPE):
             subscribers.discard(chat_id)
 
 
+async def signal_result_tracker_job(context: ContextTypes.DEFAULT_TYPE):
+    """Faol signallarni kuzatib TP yoki SL ga tegishini belgilash"""
+    active = get_active_signals()
+    for idx, sig in active:
+        cur = get_price(sig['symbol'])
+        if not cur:
+            continue
+        cur_price = cur['price']
+        if cur_price >= sig['tp']:
+            update_signal_result(idx, "WIN", cur_price)
+        elif cur_price <= sig['sl']:
+            update_signal_result(idx, "LOSS", cur_price)
+
+
 async def position_monitor_job(context: ContextTypes.DEFAULT_TYPE):
     all_data = get_all_positions()
     for str_chat_id, positions in all_data.items():
@@ -566,6 +631,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, amount_input_handler))
     app.job_queue.run_repeating(auto_signal_job, interval=SIGNAL_INTERVAL_MINUTES * 60, first=60)
     app.job_queue.run_repeating(position_monitor_job, interval=5 * 60, first=30)
+    app.job_queue.run_repeating(signal_result_tracker_job, interval=10 * 60, first=120)
     logger.info("Bot ishga tushdi!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
