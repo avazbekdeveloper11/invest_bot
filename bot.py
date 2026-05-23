@@ -5,7 +5,7 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     ContextTypes, MessageHandler, filters,
 )
-from config import BOT_TOKEN, TOP_SYMBOLS, SIGNAL_INTERVAL_MINUTES
+from config import BOT_TOKEN, TOP_SYMBOLS, SIGNAL_INTERVAL_MINUTES, OWNER_ID
 from analyzer import analyze, get_price, get_top_buy_opportunities, get_market_summary
 from news import get_crypto_news
 from positions import add_position, get_positions, remove_position, get_all_positions, update_alert_flags
@@ -155,7 +155,23 @@ def timeframe_keyboard(symbol: str) -> InlineKeyboardMarkup:
     ])
 
 
+def is_owner(update: Update) -> bool:
+    uid = update.effective_user.id if update.effective_user else 0
+    return OWNER_ID == 0 or uid == OWNER_ID
+
+
+BLOCKED_TEXT = (
+    "⛔ Bu bot shaxsiy foydalanish uchun.\n\n"
+    "Botga kirish narxi: *$100*\n"
+    "Sotib olish uchun: @mavlonov\\_avazbek ga yozing"
+)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await update.message.reply_text(BLOCKED_TEXT, parse_mode='Markdown')
+        return
+    uid = update.effective_user.id
     rate = get_uzs_rate()
     text = (
         "👋 *Crypto BUY Signal Bot*\n\n"
@@ -175,6 +191,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not is_owner(update):
+        await query.answer("⛔ Ruxsat yo'q", show_alert=True)
+        return
     await query.answer()
     data = query.data
     chat_id = query.message.chat_id
@@ -472,6 +491,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def amount_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await update.message.reply_text(BLOCKED_TEXT, parse_mode='Markdown')
+        return
     chat_id = update.message.chat_id
     if chat_id not in pending_buy:
         return
@@ -624,9 +646,15 @@ async def position_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                     logger.warning(f"Monitor sl {chat_id}: {e}")
 
 
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    await update.message.reply_text(f"Sizning ID ingiz: `{uid}`", parse_mode='Markdown')
+
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, amount_input_handler))
     app.job_queue.run_repeating(auto_signal_job, interval=SIGNAL_INTERVAL_MINUTES * 60, first=60)
