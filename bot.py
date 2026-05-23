@@ -3,64 +3,100 @@ from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes, MessageHandler, filters, ConversationHandler,
+    ContextTypes, MessageHandler, filters,
 )
 from config import BOT_TOKEN, TOP_SYMBOLS, SIGNAL_INTERVAL_MINUTES
 from analyzer import analyze, get_price, get_top_buy_opportunities, get_market_summary
 from news import get_crypto_news
 from positions import add_position, get_positions, remove_position, get_all_positions, update_alert_flags
+from currency import get_uzs_rate, usd_to_uzs, format_uzs
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 subscribers: set[int] = set()
-
-# ConversationHandler states
-ASK_AMOUNT = 1
-
-# Vaqtincha saqlanadigan ma'lumot (foydalanuvchi miqdor kiritishidan oldin)
 pending_buy: dict[int, dict] = {}
 
 
-def format_price(price: float) -> str:
+def fp(price: float) -> str:
+    """Format price: USD"""
     if price >= 1:
         return f"${price:,.4f}"
     return f"${price:.8f}"
 
 
+def fp_uzs(price: float) -> str:
+    """Format price: UZS"""
+    uzs = usd_to_uzs(price)
+    return format_uzs(uzs)
+
+
+def fp_both(price: float) -> str:
+    """USD va UZS birga"""
+    return f"`{fp(price)}` ({fp_uzs(price)})"
+
+
+def min_invest_advice(price: float, sl: float) -> str:
+    """Minimal invest tavsiyasi"""
+    risk_per_coin = price - sl
+    if risk_per_coin <= 0:
+        return "~$10"
+    # Bir savdoda max $5 yo'qotish uchun minimal invest
+    min_10 = (10 / risk_per_coin) * price
+    min_50 = (50 / risk_per_coin) * price
+    rate = get_uzs_rate()
+    return (
+        f"Kam xavf: `${min_10:.0f}` ({format_uzs(min_10 * rate)})\n"
+        f"   O'rtacha: `${min_50:.0f}` ({format_uzs(min_50 * rate)})"
+    )
+
+
 def pnl_emoji(pct: float) -> str:
-    if pct >= 5:
-        return "🚀"
-    if pct >= 2:
-        return "📈"
-    if pct >= 0:
-        return "🟡"
-    if pct >= -3:
-        return "⚠️"
+    if pct >= 5: return "🚀"
+    if pct >= 2: return "📈"
+    if pct >= 0: return "🟡"
+    if pct >= -3: return "⚠️"
     return "🔴"
 
 
 def build_analysis_text(data: dict) -> str:
-    price_str = format_price(data['price'])
-    tp_str = format_price(data['take_profit'])
-    sl_str = format_price(data['stop_loss'])
-    rr = abs((data['take_profit'] - data['price']) / max(data['price'] - data['stop_loss'], 0.0001))
+    price = data['price']
+    tp = data['take_profit']
+    sl = data['stop_loss']
+    rr = abs((tp - price) / max(price - sl, 0.0001))
+
+    # Potentsial foydani hisoblash
+    potential_pct = ((tp - price) / price) * 100
+    potential_uzs_100 = usd_to_uzs((tp - price) / price * 100)   # $100 invest bilan
+
     lines = [
         f"{data['emoji']} *{data['symbol']}* — {data['action']}",
-        f"💰 Narx: `{price_str}`",
+        f"",
+        f"💰 *Hozirgi narx:*",
+        f"   {fp_both(price)}",
         f"⏱ Interval: `{data['timeframe']}`",
         "",
         "📊 *Texnik ko'rsatkichlar:*",
     ]
     for s in data['signals']:
         lines.append(f"  {s}")
+
     lines += [
         "",
-        f"🎯 Take-Profit: `{tp_str}`",
-        f"🛑 Stop-Loss: `{sl_str}`",
+        f"🎯 *Maksimal maqsad (Take-Profit):*",
+        f"   {fp_both(tp)} (+{potential_pct:.1f}%)",
+        f"",
+        f"🛑 *Stop-Loss:*",
+        f"   {fp_both(sl)}",
         f"⚖️ Risk/Reward: `1:{rr:.1f}`",
+        f"",
+        f"💵 *Minimal invest tavsiyasi:*",
+        f"   {min_invest_advice(price, sl)}",
+        f"",
+        f"📈 *$100 invest bilan potentsial foyda:*",
+        f"   `+${(tp-price)/price*100:.2f}` ({format_uzs(potential_uzs_100)})",
+        f"",
         f"🔢 Signal kuchi: `{data['score']}/6`",
-        "",
         f"🕐 {datetime.now().strftime('%H:%M:%S')}",
     ]
     return "\n".join(lines)
@@ -102,7 +138,7 @@ def coin_keyboard(action: str) -> InlineKeyboardMarkup:
 
 
 def timeframe_keyboard(symbol: str) -> InlineKeyboardMarkup:
-    buttons = [
+    return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("5 daqiqa", callback_data=f"tf_{symbol}_5m"),
             InlineKeyboardButton("15 daqiqa", callback_data=f"tf_{symbol}_15m"),
@@ -114,20 +150,22 @@ def timeframe_keyboard(symbol: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("1 hafta", callback_data=f"tf_{symbol}_1w"),
         ],
         [InlineKeyboardButton("🔙 Orqaga", callback_data="back")],
-    ]
-    return InlineKeyboardMarkup(buttons)
+    ])
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rate = get_uzs_rate()
     text = (
         "👋 *Crypto BUY Signal Bot*\n\n"
+        f"💱 Kurs: `$1 = {format_uzs(rate)}`\n\n"
         "Real vaqtda kripto bozorini kuzatib, "
         "faqat *sotib olish* imkoniyatlarini topib beradi.\n\n"
         "• 📊 RSI, MACD, EMA, Bollinger tahlili\n"
-        "• 🎯 Take-Profit va Stop-Loss avtomatik\n"
+        "• 💵 Narx USD va UZS da\n"
+        "• 🎯 Maksimal maqsad narx\n"
+        "• 💡 Minimal invest tavsiyasi\n"
         "• 💼 Pozitsiyani saqlash va kuzatish\n"
-        "• ⚠️ Zarar xavfi bo'lsa avtomatik ogohlantirish\n"
-        "• 🔔 Har 15 daqiqada yangi BUY signal\n\n"
+        "• ⚠️ Zarar xavfi bo'lsa ogohlantirish\n\n"
         "Quyidagi tugmalardan foydalaning:"
     )
     await update.message.reply_text(text, parse_mode='Markdown', reply_markup=main_keyboard())
@@ -152,13 +190,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if p:
             change = p['change_24h'] or 0
             arrow = "📈" if change >= 0 else "📉"
+            rate = get_uzs_rate()
             text = (
                 f"💰 *{symbol}*\n\n"
-                f"Narx: `{format_price(p['price'])}`\n"
+                f"Narx: {fp_both(p['price'])}\n"
                 f"{arrow} 24s o'zgarish: `{change:+.2f}%`\n"
-                f"📊 24s yuqori: `{format_price(p['high_24h'])}`\n"
-                f"📊 24s past: `{format_price(p['low_24h'])}`\n"
-                f"💹 Hajm: `${p['volume_24h']:,.0f}`\n\n"
+                f"📊 24s yuqori: {fp_both(p['high_24h'])}\n"
+                f"📊 24s past: {fp_both(p['low_24h'])}\n"
+                f"💹 Hajm: `${p['volume_24h']:,.0f}` ({format_uzs(usd_to_uzs(p['volume_24h']))})\n"
+                f"💱 Kurs: `$1 = {format_uzs(rate)}`\n\n"
                 f"🕐 {datetime.now().strftime('%H:%M:%S')}"
             )
         else:
@@ -214,7 +254,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
             context.user_data['waiting_amount'] = True
             await query.edit_message_text(
-                f"💰 *{symbol}* — `{format_price(result['price'])}`\n\n"
+                f"💰 *{symbol}*\n"
+                f"Narx: {fp_both(result['price'])}\n\n"
                 f"Qancha USDT ga sotib oldingiz?\n"
                 f"_(Masalan: 50 yoki 100.5)_",
                 parse_mode='Markdown'
@@ -226,10 +267,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if buys:
             lines = [f"🚀 *TOP BUY SIGNALLAR* — {datetime.now().strftime('%H:%M')}\n"]
             for i, r in enumerate(buys, 1):
+                pot_pct = ((r['take_profit'] - r['price']) / r['price']) * 100
                 lines.append(
                     f"{i}. ✅ *{r['symbol']}*\n"
-                    f"   💰 {format_price(r['price'])}\n"
-                    f"   🎯 TP: {format_price(r['take_profit'])} | 🛑 SL: {format_price(r['stop_loss'])}\n"
+                    f"   💰 {fp_both(r['price'])}\n"
+                    f"   🎯 Maqsad: {fp_both(r['take_profit'])} (+{pot_pct:.1f}%)\n"
+                    f"   🛑 SL: {fp_both(r['stop_loss'])}\n"
+                    f"   💡 Min invest: {min_invest_advice(r['price'], r['stop_loss']).split(chr(10))[0].replace('Kam xavf: ', '')}\n"
                     f"   RSI: {r['rsi']:.1f} | Kuch: {r['score']}/6\n"
                 )
             text = "\n".join(lines)
@@ -267,10 +311,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     em = pnl_emoji(pnl_pct)
                     lines.append(
                         f"{i+1}. {em} *{p['symbol']}*\n"
-                        f"   Kirish: `{format_price(p['buy_price'])}` → Hozir: `{format_price(cur_price)}`\n"
-                        f"   Miqdor: `${p['amount_usd']:.1f}` → Qiymat: `${cur_val:.2f}`\n"
-                        f"   PnL: `{pnl_usd:+.2f}$ ({pnl_pct:+.1f}%)`\n"
-                        f"   🎯 TP: `{format_price(p['take_profit'])}` | 🛑 SL: `{format_price(p['stop_loss'])}`\n"
+                        f"   Kirish: {fp_both(p['buy_price'])}\n"
+                        f"   Hozir: {fp_both(cur_price)}\n"
+                        f"   Miqdor: `${p['amount_usd']:.1f}` → `${cur_val:.2f}`\n"
+                        f"   PnL: `{pnl_usd:+.2f}$` ({format_uzs(usd_to_uzs(abs(pnl_usd)))}) `({pnl_pct:+.1f}%)`\n"
+                        f"   🎯 Maqsad: {fp_both(p['take_profit'])}\n"
                         f"   📅 {p['opened_at']}\n"
                     )
                 else:
@@ -300,9 +345,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 em = pnl_emoji(pnl_pct)
                 result_text = (
                     f"{em} *{p['symbol']}* pozitsiya yopildi\n\n"
-                    f"Kirish: `{format_price(p['buy_price'])}`\n"
-                    f"Chiqish: `{format_price(cur_price)}`\n"
-                    f"Natija: `{pnl_usd:+.2f}$ ({pnl_pct:+.1f}%)`\n"
+                    f"Kirish: {fp_both(p['buy_price'])}\n"
+                    f"Chiqish: {fp_both(cur_price)}\n"
+                    f"Natija: `{pnl_usd:+.2f}$` ({format_uzs(usd_to_uzs(pnl_usd))}) `({pnl_pct:+.1f}%)`\n"
                 )
             else:
                 result_text = f"*{p['symbol']}* pozitsiya yopildi."
@@ -321,15 +366,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         neutral = len(results) - bullish - bearish
         mood = "🟢 BULLISH — Sotib olish vaqti!" if bullish > bearish else \
                "🔴 BEARISH — Ehtiyot bo'ling" if bearish > bullish else "🟡 NEYTRAL — Kuting"
+        rate = get_uzs_rate()
         lines = [
             f"🌍 *Bozor holati:* {mood}\n",
+            f"💱 Kurs: `$1 = {format_uzs(rate)}`\n",
             f"🟢 BUY signal: *{bullish}* ta",
             f"🟡 Neytral: *{neutral}* ta",
             f"🔴 Pastga: *{bearish}* ta\n",
             "🚀 *BUY uchun tayyor koinlar:*",
         ]
-        for r in [x for x in results if x['score'] >= 2][:8]:
-            lines.append(f"  ✅ *{r['symbol']}*: {format_price(r['price'])} | Ball: {r['score']}")
+        for r in [x for x in results if x['score'] >= 2][:6]:
+            pot = ((r['take_profit'] - r['price']) / r['price']) * 100
+            lines.append(
+                f"  ✅ *{r['symbol']}*: {fp_both(r['price'])}\n"
+                f"     🎯 Maqsad: {fp_both(r['take_profit'])} (+{pot:.1f}%)"
+            )
         if not any(r['score'] >= 2 for r in results):
             lines.append("  😐 Hozircha yo'q")
         kb = InlineKeyboardMarkup([[
@@ -373,7 +424,6 @@ async def amount_input_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     chat_id = update.message.chat_id
     if chat_id not in pending_buy:
         return
-
     text = update.message.text.strip().replace(",", ".")
     try:
         amount_usd = float(text)
@@ -385,7 +435,6 @@ async def amount_input_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode='Markdown'
         )
         return
-
     info = pending_buy.pop(chat_id)
     add_position(
         chat_id=chat_id,
@@ -395,15 +444,17 @@ async def amount_input_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         take_profit=info['take_profit'],
         stop_loss=info['stop_loss'],
     )
-
     coins = amount_usd / info['buy_price']
+    pot_usd = (info['take_profit'] - info['buy_price']) / info['buy_price'] * amount_usd
     await update.message.reply_text(
         f"✅ *Pozitsiya saqlandi!*\n\n"
         f"🪙 *{info['symbol']}*\n"
-        f"💰 Kirish narxi: `{format_price(info['buy_price'])}`\n"
-        f"💵 Miqdor: `${amount_usd:.2f}` → `{coins:.6f}` koin\n"
-        f"🎯 Take-Profit: `{format_price(info['take_profit'])}`\n"
-        f"🛑 Stop-Loss: `{format_price(info['stop_loss'])}`\n\n"
+        f"💰 Kirish narxi: {fp_both(info['buy_price'])}\n"
+        f"💵 Miqdor: `${amount_usd:.2f}` ({format_uzs(usd_to_uzs(amount_usd))})\n"
+        f"🪙 Koin: `{coins:.6f}`\n"
+        f"🎯 Maqsad: {fp_both(info['take_profit'])}\n"
+        f"📈 Potentsial foyda: `+${pot_usd:.2f}` ({format_uzs(usd_to_uzs(pot_usd))})\n"
+        f"🛑 Stop-Loss: {fp_both(info['stop_loss'])}\n\n"
         f"Narx o'zgarganda sizga xabar beraman! 🔔",
         parse_mode='Markdown',
         reply_markup=main_keyboard()
@@ -411,7 +462,6 @@ async def amount_input_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def auto_signal_job(context: ContextTypes.DEFAULT_TYPE):
-    """Har N daqiqada BUY signal yuborish"""
     if not subscribers:
         return
     buys = get_top_buy_opportunities()
@@ -419,10 +469,12 @@ async def auto_signal_job(context: ContextTypes.DEFAULT_TYPE):
         return
     lines = [f"⚡ *BUY SIGNAL* — {datetime.now().strftime('%H:%M')}\n"]
     for r in buys[:4]:
+        pot_pct = ((r['take_profit'] - r['price']) / r['price']) * 100
         lines.append(
             f"✅ *{r['symbol']}*\n"
-            f"   💰 {format_price(r['price'])} | 🎯 {format_price(r['take_profit'])} | 🛑 {format_price(r['stop_loss'])}\n"
-            f"   RSI: {r['rsi']:.1f} | Kuch: {r['score']}/6\n"
+            f"   💰 {fp_both(r['price'])}\n"
+            f"   🎯 {fp_both(r['take_profit'])} (+{pot_pct:.1f}%)\n"
+            f"   🛑 {fp_both(r['stop_loss'])}\n"
         )
     text = "\n".join(lines)
     buttons = [[InlineKeyboardButton(f"✅ {r['symbol']} sotib oldim", callback_data=f"bought_{r['symbol']}")]
@@ -438,7 +490,6 @@ async def auto_signal_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def position_monitor_job(context: ContextTypes.DEFAULT_TYPE):
-    """Har 5 daqiqada barcha pozitsiyalarni kuzatish va xavf bo'lsa ogohlantirish"""
     all_data = get_all_positions()
     for str_chat_id, positions in all_data.items():
         chat_id = int(str_chat_id)
@@ -448,21 +499,18 @@ async def position_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                 continue
             cur_price = cur['price']
             pnl_pct = ((cur_price - p['buy_price']) / p['buy_price']) * 100
-            cur_val = p['coins'] * cur_price
-            pnl_usd = cur_val - p['amount_usd']
-
-            # Stop-loss ga yaqinlashdi (5% ichida) yoki oshib ketdi
+            pnl_usd = p['coins'] * cur_price - p['amount_usd']
             sl_dist_pct = ((cur_price - p['stop_loss']) / p['buy_price']) * 100
 
             if not p.get('alerted_sl') and sl_dist_pct <= 5:
                 msg = (
                     f"🚨 *ZARAR OGOHLANTIRISH!*\n\n"
                     f"*{p['symbol']}* stop-loss ga yaqinlashdi!\n\n"
-                    f"📉 Hozirgi narx: `{format_price(cur_price)}`\n"
-                    f"🛑 Stop-Loss: `{format_price(p['stop_loss'])}`\n"
+                    f"📉 Hozir: {fp_both(cur_price)}\n"
+                    f"🛑 Stop-Loss: {fp_both(p['stop_loss'])}\n"
                     f"📏 Masofa: `{sl_dist_pct:.1f}%`\n"
-                    f"💸 Hozirgi PnL: `{pnl_usd:+.2f}$ ({pnl_pct:+.1f}%)`\n\n"
-                    f"⚠️ *Zararga kirish xavfi bor! Sotishni ko'rib chiqing.*"
+                    f"💸 PnL: `{pnl_usd:+.2f}$` ({format_uzs(usd_to_uzs(pnl_usd))}) `({pnl_pct:+.1f}%)`\n\n"
+                    f"⚠️ *Sotishni ko'rib chiqing!*"
                 )
                 kb = InlineKeyboardMarkup([[
                     InlineKeyboardButton(f"❌ {p['symbol']} yopish", callback_data=f"close_pos_{i}"),
@@ -472,21 +520,19 @@ async def position_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_message(chat_id, msg, parse_mode='Markdown', reply_markup=kb)
                     update_alert_flags(chat_id, i, sl=True)
                 except Exception as e:
-                    logger.warning(f"Monitor alert {chat_id}: {e}")
+                    logger.warning(f"Monitor {chat_id}: {e}")
 
-            # Take-profit ga yetdi
             elif not p.get('alerted_tp') and cur_price >= p['take_profit']:
                 msg = (
-                    f"🎯 *TAKE-PROFIT YETDI!*\n\n"
-                    f"*{p['symbol']}* maqsad narxga yetdi!\n\n"
-                    f"📈 Hozirgi narx: `{format_price(cur_price)}`\n"
-                    f"🎯 Take-Profit: `{format_price(p['take_profit'])}`\n"
-                    f"💰 Foyda: `{pnl_usd:+.2f}$ ({pnl_pct:+.1f}%)`\n\n"
+                    f"🎯 *MAQSAD NARXGA YETDI!*\n\n"
+                    f"*{p['symbol']}* take-profit ga yetdi!\n\n"
+                    f"📈 Hozir: {fp_both(cur_price)}\n"
+                    f"🎯 Maqsad: {fp_both(p['take_profit'])}\n"
+                    f"💰 Foyda: `+{pnl_usd:.2f}$` ({format_uzs(usd_to_uzs(pnl_usd))}) `({pnl_pct:+.1f}%)`\n\n"
                     f"✅ *Sotishni ko'rib chiqing!*"
                 )
                 kb = InlineKeyboardMarkup([[
                     InlineKeyboardButton(f"✅ {p['symbol']} yopish (foyda)", callback_data=f"close_pos_{i}"),
-                    InlineKeyboardButton("💼 Pozitsiyalar", callback_data="my_positions"),
                 ]])
                 try:
                     await context.bot.send_message(chat_id, msg, parse_mode='Markdown', reply_markup=kb)
@@ -494,14 +540,13 @@ async def position_monitor_job(context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     logger.warning(f"Monitor tp {chat_id}: {e}")
 
-            # SL oshib ketdi (narx SL dan past)
             elif cur_price < p['stop_loss'] and not p.get('alerted_sl'):
                 msg = (
                     f"🔴 *STOP-LOSS OSHDI!*\n\n"
-                    f"*{p['symbol']}* stop-loss narxidan past tushdi!\n\n"
-                    f"📉 Hozirgi narx: `{format_price(cur_price)}`\n"
-                    f"🛑 Stop-Loss: `{format_price(p['stop_loss'])}`\n"
-                    f"💸 Zarar: `{pnl_usd:+.2f}$ ({pnl_pct:+.1f}%)`\n\n"
+                    f"*{p['symbol']}* SL dan past tushdi!\n\n"
+                    f"📉 Hozir: {fp_both(cur_price)}\n"
+                    f"🛑 Stop-Loss: {fp_both(p['stop_loss'])}\n"
+                    f"💸 Zarar: `{pnl_usd:+.2f}$` ({format_uzs(usd_to_uzs(abs(pnl_usd)))}) `({pnl_pct:+.1f}%)`\n\n"
                     f"❗ *Zudlik bilan sotishni ko'rib chiqing!*"
                 )
                 kb = InlineKeyboardMarkup([[
@@ -516,14 +561,11 @@ async def position_monitor_job(context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, amount_input_handler))
-
     app.job_queue.run_repeating(auto_signal_job, interval=SIGNAL_INTERVAL_MINUTES * 60, first=60)
     app.job_queue.run_repeating(position_monitor_job, interval=5 * 60, first=30)
-
     logger.info("Bot ishga tushdi!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
